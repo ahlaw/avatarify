@@ -4,4 +4,4 @@
 CAMID_VIRT=9
 
 # Conda environment name
-CONDA_ENV_NAME=avatarify
+CONDA_ENV_NAME=vtubify

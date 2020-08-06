@@ -1,112 +1,80 @@
-from scipy.spatial import ConvexHull
+import cv2
+import dlib
 import torch
-import yaml
-from modules.keypoint_detector import KPDetector
-from modules.generator_optim import OcclusionAwareGenerator
-from sync_batchnorm import DataParallelWithCallback
-import numpy as np
-import face_alignment
-from animate import normalize_kp
 
-
-def to_tensor(a):
-    return torch.tensor(a[np.newaxis].astype(np.float32)).permute(0, 3, 1, 2) / 255
+from thad.poser.morph_rotate_combine_poser import MorphRotateCombinePoser256Param6
+from thad.puppet.head_pose_solver import HeadPoseSolver
+from thad.poser.poser import Poser
+from thad.puppet.util import compute_left_eye_normalized_ratio, compute_right_eye_normalized_ratio, \
+    compute_mouth_normalized_ratio
+from thad.tha.combiner import CombinerSpec
+from thad.tha.face_morpher import FaceMorpherSpec
+from thad.tha.two_algo_face_rotator import TwoAlgoFaceRotatorSpec
+from thad.util import rgba_to_numpy_image_greenscreen, extract_pytorch_image_from_filelike
 
 
 class PredictorLocal:
-    def __init__(self, config_path, checkpoint_path, relative=False, adapt_movement_scale=False, device=None, enc_downscale=1):
+    def __init__(self, device=None):
         self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
-        self.relative = relative
-        self.adapt_movement_scale = adapt_movement_scale
-        self.start_frame = None
-        self.start_frame_kp = None
-        self.kp_driving_initial = None
-        self.config_path = config_path
-        self.checkpoint_path = checkpoint_path
-        self.generator, self.kp_detector = self.load_checkpoints()
-        self.fa = face_alignment.FaceAlignment(face_alignment.LandmarksType._2D, flip_input=True, device=self.device)
-        self.source = None
-        self.kp_source = None
-        self.enc_downscale = enc_downscale
+        self.poser = MorphRotateCombinePoser256Param6(
+            morph_module_spec=FaceMorpherSpec(),
+            morph_module_file_name="checkpoints/face_morpher.pt",
+            rotate_module_spec=TwoAlgoFaceRotatorSpec(),
+            rotate_module_file_name="checkpoints/two_algo_face_rotator.pt",
+            combine_module_spec=CombinerSpec(),
+            combine_module_file_name="checkpoints/combiner.pt",
+            device=self.device)
+        self.face_detector = dlib.get_frontal_face_detector()
+        self.landmark_locator = dlib.shape_predictor("checkpoints/shape_predictor_68_face_landmarks.dat")
+        self.head_pose_solver = HeadPoseSolver()
+        self.pose_size = len(self.poser.pose_parameters())
+        self.source_image = None
+        self.current_pose = None
+        self.last_pose = None
 
-    def load_checkpoints(self):
-        with open(self.config_path) as f:
-            config = yaml.load(f)
-    
-        generator = OcclusionAwareGenerator(**config['model_params']['generator_params'],
-                                            **config['model_params']['common_params'])
-        generator.to(self.device)
-    
-        kp_detector = KPDetector(**config['model_params']['kp_detector_params'],
-                                 **config['model_params']['common_params'])
-        kp_detector.to(self.device)
-    
-        checkpoint = torch.load(self.checkpoint_path, map_location=self.device)
-        generator.load_state_dict(checkpoint['generator'])
-        kp_detector.load_state_dict(checkpoint['kp_detector'])
-    
-        generator.eval()
-        kp_detector.eval()
-        
-        return generator, kp_detector
-
-    def reset_frames(self):
-        self.kp_driving_initial = None
-
-    def set_source_image(self, source_image):
-        self.source = to_tensor(source_image).to(self.device)
-        self.kp_source = self.kp_detector(self.source)
-
-        if self.enc_downscale > 1:
-            h, w = int(self.source.shape[2] / self.enc_downscale), int(self.source.shape[3] / self.enc_downscale)
-            source_enc = torch.nn.functional.interpolate(self.source, size=(h, w), mode='bilinear')
-        else:
-            source_enc = self.source
-
-        self.generator.encode_source(source_enc)
+    def set_source_image(self, image):
+        self.source_image = image.to(self.device).unsqueeze(dim=0)
 
     def predict(self, driving_frame):
-        assert self.kp_source is not None, "call set_source_image()"
-        
-        with torch.no_grad():
-            driving = to_tensor(driving_frame).to(self.device)
+        assert self.source_image is not None, "call set_source_image()"
 
-            if self.kp_driving_initial is None:
-                self.kp_driving_initial = self.kp_detector(driving)
-                self.start_frame = driving_frame.copy()
-                self.start_frame_kp = self.get_frame_kp(driving_frame)
+        rgb_frame = cv2.cvtColor(driving_frame, cv2.COLOR_BGR2RGB)
+        faces = self.face_detector(rgb_frame)
+        euler_angles = None
+        face_landmarks = None
+        if len(faces) > 0:
+            face_rect = faces[0]
+            face_landmarks = self.landmark_locator(rgb_frame, face_rect)
+            face_box_points, euler_angles = self.head_pose_solver.solve_head_pose(face_landmarks)
 
-            kp_driving = self.kp_detector(driving)
-            kp_norm = normalize_kp(kp_source=self.kp_source, kp_driving=kp_driving,
-                                kp_driving_initial=self.kp_driving_initial, use_relative_movement=self.relative,
-                                use_relative_jacobian=self.relative, adapt_movement_scale=self.adapt_movement_scale)
+        if euler_angles is not None and self.source_image is not None:
+            self.current_pose = torch.zeros(self.pose_size, device=self.device)
+            self.current_pose[0] = max(min(-euler_angles.item(0) / 15.0, 1.0), -1.0)
+            self.current_pose[1] = max(min(-euler_angles.item(1) / 15.0, 1.0), -1.0)
+            self.current_pose[2] = max(min(euler_angles.item(2) / 15.0, 1.0), -1.0)
 
-            out = self.generator(self.source, kp_source=self.kp_source, kp_driving=kp_norm)
+            if self.last_pose is None:
+                self.last_pose = self.current_pose
+            else:
+                self.current_pose = self.current_pose * 0.5 + self.last_pose * 0.5
+                self.last_pose = self.current_pose
 
-            out = np.transpose(out['prediction'].data.cpu().numpy(), [0, 2, 3, 1])[0]
-            out = (np.clip(out, 0, 1) * 255).astype(np.uint8)
+            eye_min_ratio = 0.15
+            eye_max_ratio = 0.25
+            left_eye_normalized_ratio = compute_left_eye_normalized_ratio(face_landmarks, eye_min_ratio, eye_max_ratio)
+            self.current_pose[3] = 1 - left_eye_normalized_ratio
+            right_eye_normalized_ratio = compute_right_eye_normalized_ratio(face_landmarks,
+                                                                            eye_min_ratio,
+                                                                            eye_max_ratio)
+            self.current_pose[4] = 1 - right_eye_normalized_ratio
 
+            min_mouth_ratio = 0.02
+            max_mouth_ratio = 0.3
+            mouth_normalized_ratio = compute_mouth_normalized_ratio(face_landmarks, min_mouth_ratio, max_mouth_ratio)
+            self.current_pose[5] = mouth_normalized_ratio
+
+            self.current_pose = self.current_pose.unsqueeze(dim=0)
+
+            posed_image = self.poser.pose(self.source_image, self.current_pose).detach().cpu()
+            out = rgba_to_numpy_image_greenscreen(posed_image[0])
             return out
-
-    def get_frame_kp(self, image):
-        kp_landmarks = self.fa.get_landmarks(image)
-        if kp_landmarks:
-            kp_image = kp_landmarks[0]
-            kp_image = self.normalize_alignment_kp(kp_image)
-            return kp_image
-        else:
-            return None
-
-    @staticmethod
-    def normalize_alignment_kp(kp):
-        kp = kp - kp.mean(axis=0, keepdims=True)
-        area = ConvexHull(kp[:, :2]).volume
-        area = np.sqrt(area)
-        kp[:, :2] = kp[:, :2] / area
-        return kp
-    
-    def get_start_frame(self):
-        return self.start_frame
-
-    def get_start_frame_kp(self):
-        return self.start_frame_kp

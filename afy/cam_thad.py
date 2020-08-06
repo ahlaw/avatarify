@@ -1,4 +1,5 @@
 import os, sys
+from sys import platform as _platform
 import glob
 import yaml
 import time
@@ -9,50 +10,20 @@ import cv2
 
 from afy.videocaptureasync import VideoCaptureAsync
 from afy.arguments import opt
-from afy.utils import Once, log, crop, pad_img, resize, TicToc
+from afy.utils import info, Once, Tee, crop, pad_img, resize, TicToc
+import afy.camera_selector as cam_selector
+
+from thad.util import extract_pytorch_image_from_filelike
 
 
-from sys import platform as _platform
-_streaming = False
-if _platform == 'linux' or _platform == 'linux2':
-    import pyfakewebcam
-    _streaming = True
+log = Tee('./var/log/cam_thad.log')
 
 
 if _platform == 'darwin':
-    if opt.worker_host is None:
-        log('\nOnly remote GPU mode is supported for Mac (use --worker-host option to connect to the server)')
-        log('Standalone version will be available lately!\n')
+    if not opt.is_client:
+        info('\nOnly remote GPU mode is supported for Mac (use --is-client and --connect options to connect to the server)')
+        info('Standalone version will be available lately!\n')
         exit()
-
-
-def is_new_frame_better(source, driving, precitor):
-    global avatar_kp
-    global display_string
-    
-    if avatar_kp is None:
-        display_string = "No face detected in avatar."
-        return False
-    
-    if predictor.get_start_frame() is None:
-        display_string = "No frame to compare to."
-        return True
-    
-    driving_smaller = resize(driving, (128, 128))[..., :3]
-    new_kp = predictor.get_frame_kp(driving)
-    
-    if new_kp is not None:
-        new_norm = (np.abs(avatar_kp - new_kp) ** 2).sum()
-        old_norm = (np.abs(avatar_kp - predictor.get_start_frame_kp()) ** 2).sum()
-        
-        out_string = "{0} : {1}".format(int(new_norm * 100), int(old_norm * 100))
-        display_string = out_string
-        log(out_string)
-        
-        return new_norm < old_norm
-    else:
-        display_string = "No face found!"
-        return False
 
 
 def load_stylegan_avatar():
@@ -67,11 +38,19 @@ def load_stylegan_avatar():
 
     return image
 
+def load_images():
+    avatars = []
+    filenames = []
+    images_list = sorted(glob.glob(f'{opt.avatars}/*'))
+    for i, f in enumerate(images_list):
+        if f.endswith('.jpg') or f.endswith('.jpeg') or f.endswith('.png'):
+            image = extract_pytorch_image_from_filelike(f)
+            avatars.append(image)
+            filenames.append(f)
+    return avatars, filenames
 
 def change_avatar(predictor, new_avatar):
-    global avatar, avatar_kp, kp_source
-    avatar_kp = predictor.get_frame_kp(new_avatar)
-    kp_source = None
+    global avatar
     avatar = new_avatar
     predictor.set_source_image(avatar)
 
@@ -86,75 +65,124 @@ def draw_rect(img, rw=0.6, rh=0.8, color=(255, 0, 0), thickness=2):
 
 
 def print_help():
-    log('\n\n=== Control keys ===')
-    log('1-9: Change avatar')
-    log('W: Zoom camera in')
-    log('S: Zoom camera out')
-    log('A: Previous avatar in folder')
-    log('D: Next avatar in folder')
-    log('Q: Get random avatar')
-    log('X: Calibrate face pose')
-    log('I: Show FPS')
-    log('ESC: Quit')
-    log('\nFull key list: https://github.com/alievk/avatarify#controls')
-    log('\n\n')
+    info('\n\n=== Control keys ===')
+    info('1-9: Change avatar')
+    for i, fname in enumerate(avatar_names):
+        key = i + 1
+        name = fname.split('/')[-1]
+        info(f'{key}: {name}')
+    info('W: Zoom camera in')
+    info('S: Zoom camera out')
+    info('A: Previous avatar in folder')
+    info('D: Next avatar in folder')
+    info('Q: Get random avatar')
+    info('X: Calibrate face pose')
+    info('I: Show FPS')
+    info('ESC: Quit')
+    info('\nFull key list: https://github.com/alievk/avatarify#controls')
+    info('\n\n')
+
+
+def draw_fps(frame, fps, timing, x0=10, y0=20, ystep=30, fontsz=0.5, color=(255, 255, 255)):
+    frame = frame.copy()
+    cv2.putText(frame, f"FPS: {fps:.1f}", (x0, y0 + ystep * 0), 0, fontsz * IMG_SIZE / 256, color, 1)
+    cv2.putText(frame, f"Model time (ms): {timing['predict']:.1f}", (x0, y0 + ystep * 1), 0, fontsz * IMG_SIZE / 256, color, 1)
+    cv2.putText(frame, f"Preproc time (ms): {timing['preproc']:.1f}", (x0, y0 + ystep * 2), 0, fontsz * IMG_SIZE / 256, color, 1)
+    cv2.putText(frame, f"Postproc time (ms): {timing['postproc']:.1f}", (x0, y0 + ystep * 3), 0, fontsz * IMG_SIZE / 256, color, 1)
+    return frame
+
+
+def draw_calib_text(frame, thk=2, fontsz=0.5, color=(0, 0, 255)):
+    frame = frame.copy()
+    cv2.putText(frame, "FIT FACE IN RECTANGLE", (40, 20), 0, fontsz * IMG_SIZE / 255, color, thk)
+    cv2.putText(frame, "W - ZOOM IN", (60, 40), 0, fontsz * IMG_SIZE / 255, color, thk)
+    cv2.putText(frame, "S - ZOOM OUT", (60, 60), 0, fontsz * IMG_SIZE / 255, color, thk)
+    cv2.putText(frame, "THEN PRESS X", (60, 245), 0, fontsz * IMG_SIZE / 255, color, thk)
+    return frame
+
+
+def select_camera(config):
+    cam_config = config['cam_config']
+    cam_id = None
+
+    if os.path.isfile(cam_config):
+        with open(cam_config, 'r') as f:
+            cam_config = yaml.load(f, Loader=yaml.FullLoader)
+            cam_id = cam_config['cam_id']
+    else:
+        cam_frames = cam_selector.query_cameras(config['query_n_cams'])
+
+        if cam_frames:
+            cam_id = cam_selector.select_camera(cam_frames, window="CLICK ON YOUR CAMERA")
+            log(f"Selected camera {cam_id}")
+
+            with open(cam_config, 'w') as f:
+                yaml.dump({'cam_id': cam_id}, f)
+        else:
+            log("No cameras are available")
+
+    return cam_id
+
 
 if __name__ == "__main__":
+    with open('config.yaml', 'r') as f:
+        config = yaml.load(f, Loader=yaml.FullLoader)
 
     global display_string
     display_string = ""
 
     IMG_SIZE = 256
 
-    if opt.no_stream:
-        log('Force no streaming')
-        _streaming = False
-
     log('Loading Predictor')
     predictor_args = {
-        'config_path': opt.config,
-        'checkpoint_path': opt.checkpoint,
-        'relative': opt.relative,
-        'adapt_movement_scale': opt.adapt_scale,
-        'enc_downscale': opt.enc_downscale
     }
     if opt.is_worker:
         from afy import predictor_worker
-        predictor_worker.run_worker(opt.worker_port)
+        predictor_worker.run_worker(opt.in_port, opt.out_port)
         sys.exit(0)
-    elif opt.worker_host:
+    elif opt.is_client:
         from afy import predictor_remote
-        predictor = predictor_remote.PredictorRemote(
-            worker_host=opt.worker_host, worker_port=opt.worker_port,
-            **predictor_args
-        )
+        try:
+            predictor = predictor_remote.PredictorRemote(
+                in_addr=opt.in_addr, out_addr=opt.out_addr,
+                **predictor_args
+            )
+        except ConnectionError as err:
+            log(err)
+            sys.exit(1)
+        predictor.start()
     else:
         from afy import predictor_local
         predictor = predictor_local.PredictorLocal(
             **predictor_args
         )
 
-    avatars=[]
-    images_list = sorted(glob.glob(f'{opt.avatars}/*'))
-    for i, f in enumerate(images_list):
-        if f.endswith('.jpg') or f.endswith('.jpeg') or f.endswith('.png'):
-            key = len(avatars) + 1
-            log(f'Key {key}: {f}')
-            img = cv2.imread(f)
-            if img.ndim == 2:
-                img = np.tile(img[..., None], [1, 1, 3])
-            img = img[..., :3][..., ::-1]
-            img = resize(img, (IMG_SIZE, IMG_SIZE))
-            avatars.append(img)
+    cam_id = select_camera(config)
 
+    if cam_id is None:
+        exit(1)
 
-    cap = VideoCaptureAsync(opt.cam)
+    cap = VideoCaptureAsync(cam_id)
     cap.start()
 
-    if _streaming:
-        ret, frame = cap.read()
-        stream_img_size = frame.shape[1], frame.shape[0]
-        stream = pyfakewebcam.FakeWebcam(f'/dev/video{opt.virt_cam}', *stream_img_size)
+    avatars, avatar_names = load_images()
+
+    enable_vcam = not opt.no_stream
+
+    ret, frame = cap.read()
+    stream_img_size = frame.shape[1], frame.shape[0]
+
+    if enable_vcam:
+        if _platform in ['linux', 'linux2']:
+            try:
+                import pyfakewebcam
+            except ImportError:
+                log("pyfakewebcam is not installed.")
+                exit(1)
+
+            stream = pyfakewebcam.FakeWebcam(f'/dev/video{opt.virt_cam}', *stream_img_size)
+        else:
+            enable_vcam = False
 
     cur_ava = 0    
     avatar = None
@@ -171,7 +199,6 @@ if __name__ == "__main__":
     overlay_alpha = 0.0
     preview_flip = False
     output_flip = False
-    find_keyframe = False
     is_calibrated = False
 
     fps_hist = []
@@ -206,26 +233,20 @@ if __name__ == "__main__":
             frame_lrudwh = lrudwh
             frame = resize(frame, (IMG_SIZE, IMG_SIZE))[..., :3]
 
-            if find_keyframe:
-                if is_new_frame_better(avatar, frame, predictor):
-                    log("Taking new frame!")
-                    green_overlay = True
-                    predictor.reset_frames()
-
             timing['preproc'] = tt.toc()
 
             if passthrough:
                 out = frame
-            else:
+            elif is_calibrated:
                 tt.tic()
-                pred = predictor.predict(frame)
-                out = pred
+                out = predictor.predict(frame)
+                if out is None:
+                    log('predict returned None')
                 timing['predict'] = tt.toc()
+            else:
+                out = None
 
             tt.tic()
-
-            if not opt.no_pad:
-                out = pad_img(out, stream_img_size)
             
             key = cv2.waitKey(1)
 
@@ -278,8 +299,6 @@ if __name__ == "__main__":
                 frame_offset_y = 0
                 frame_proportion = 0.9
             elif key == ord('x'):
-                predictor.reset_frames()
-
                 if not is_calibrated:
                     cv2.namedWindow('avatarify', cv2.WINDOW_GUI_NORMAL)
                     cv2.moveWindow('avatarify', 600, 250)
@@ -293,8 +312,6 @@ if __name__ == "__main__":
                 preview_flip = not preview_flip
             elif key == ord('t'):
                 output_flip = not output_flip
-            elif key == ord('f'):
-                find_keyframe = not find_keyframe
             elif key == ord('q'):
                 try:
                     log('Loading StyleGAN avatar...')
@@ -303,6 +320,14 @@ if __name__ == "__main__":
                     change_avatar(predictor, avatar)
                 except:
                     log('Failed to load StyleGAN avatar')
+            elif key == ord('l'):
+                try:
+                    log('Reloading avatars...')
+                    avatars, avatar_names = load_images()
+                    passthrough = False
+                    log("Images reloaded")
+                except:
+                    log('Image reload failed')
             elif key == ord('i'):
                 show_fps = not show_fps
             elif 48 < key < 58:
@@ -314,10 +339,6 @@ if __name__ == "__main__":
             elif key != -1:
                 log(key)
 
-            if _streaming:
-                out = resize(out, stream_img_size)
-                stream.schedule_frame(out)
-
             if overlay_alpha > 0:
                 preview_frame = cv2.addWeighted( avatars[cur_ava], overlay_alpha, frame, 1.0 - overlay_alpha, 0.0)
             else:
@@ -325,9 +346,6 @@ if __name__ == "__main__":
             
             if preview_flip:
                 preview_frame = cv2.flip(preview_frame, 1)
-                
-            if output_flip:
-                out = cv2.flip(out, 1)
                 
             if green_overlay:
                 green_alpha = 0.8
@@ -337,38 +355,44 @@ if __name__ == "__main__":
 
             timing['postproc'] = tt.toc()
                 
-            if find_keyframe:
-                preview_frame = cv2.putText(preview_frame, display_string, (10, 220), 0, 0.5 * IMG_SIZE / 256, (255, 255, 255), 1)
-
             if show_fps:
-                timing_string = f"FPS/Model/Pre/Post: {fps:.1f} / {timing['predict']:.1f} / {timing['preproc']:.1f} / {timing['postproc']:.1f}"
-                preview_frame = cv2.putText(preview_frame, timing_string, (10, 240), 0, 0.3 * IMG_SIZE / 256, (255, 255, 255), 1)
+                preview_frame = draw_fps(preview_frame, fps, timing)
 
             if not is_calibrated:
-                color = (0, 0, 255)
-                thk = 2
-                fontsz = 0.5
-                preview_frame = cv2.putText(preview_frame, "FIT FACE IN RECTANGLE", (40, 20), 0, fontsz * IMG_SIZE / 255, color, thk)
-                preview_frame = cv2.putText(preview_frame, "W - ZOOM IN", (60, 40), 0, fontsz * IMG_SIZE / 255, color, thk)
-                preview_frame = cv2.putText(preview_frame, "S - ZOOM OUT", (60, 60), 0, fontsz * IMG_SIZE / 255, color, thk)
-                preview_frame = cv2.putText(preview_frame, "THEN PRESS X", (60, 245), 0, fontsz * IMG_SIZE / 255, color, thk)
+                preview_frame = draw_calib_text(preview_frame)
 
             if not opt.hide_rect:
                 draw_rect(preview_frame)
 
-            # cv2.imshow('cam', preview_frame[..., ::-1])
-            if is_calibrated:
-                cv2.destroyWindow('cam')
+            cv2.imshow('cam', preview_frame[..., ::-1])
+
+            if out is not None:
+                if not opt.no_pad:
+                    out = pad_img(out, stream_img_size)
+
+                if output_flip:
+                    out = cv2.flip(out, 1)
+
+                if enable_vcam:
+                    out = resize(out, stream_img_size)
+                    stream.schedule_frame(out)
+
                 cv2.imshow('avatarify', out[..., ::-1])
-            else:
-                cv2.imshow('cam', preview_frame[..., ::-1])
 
             fps_hist.append(tt.toc(total=True))
             if len(fps_hist) == 10:
                 fps = 10 / (sum(fps_hist) / 1000)
                 fps_hist = []
     except KeyboardInterrupt:
-        pass
+        log("main: user interrupt")
 
+    log("stopping camera")
     cap.stop()
+
     cv2.destroyAllWindows()
+
+    if opt.is_client:
+        log("stopping remote predictor")
+        predictor.stop()
+
+    log("main: exit")

@@ -1,5 +1,7 @@
-vox-adv-cpk.pth.tar
-
 __pycache__
 
 *.log
+
+cam.yaml
+checkpoints/
+thad/
