@@ -13,7 +13,7 @@ from afy.arguments import opt
 from afy.utils import info, Once, Tee, crop, pad_img, resize, TicToc
 import afy.camera_selector as cam_selector
 
-from thad.util import extract_pytorch_image_from_filelike
+from thad.util import extract_numpy_image_from_filelike
 
 
 log = Tee('./var/log/cam_thad.log')
@@ -44,7 +44,7 @@ def load_images():
     images_list = sorted(glob.glob(f'{opt.avatars}/*'))
     for i, f in enumerate(images_list):
         if f.endswith('.jpg') or f.endswith('.jpeg') or f.endswith('.png'):
-            image = extract_pytorch_image_from_filelike(f)
+            image = extract_numpy_image_from_filelike(f)
             avatars.append(image)
             filenames.append(f)
     return avatars, filenames

@@ -10,7 +10,7 @@ from thad.puppet.util import compute_left_eye_normalized_ratio, compute_right_ey
 from thad.tha.combiner import CombinerSpec
 from thad.tha.face_morpher import FaceMorpherSpec
 from thad.tha.two_algo_face_rotator import TwoAlgoFaceRotatorSpec
-from thad.util import rgba_to_numpy_image_greenscreen, extract_pytorch_image_from_filelike
+from thad.util import rgba_to_numpy_image_greenscreen
 
 
 class PredictorLocal:
@@ -33,7 +33,13 @@ class PredictorLocal:
         self.last_pose = None
 
     def set_source_image(self, image):
-        self.source_image = image.to(self.device).unsqueeze(dim=0)
+        image_size = image.shape[0]
+        image = image \
+                    .reshape(image_size * image_size, 4) \
+                    .transpose() \
+                    .reshape(4, image_size, image_size)
+        torch_image = torch.from_numpy(image).float() * 2.0 - 1.0
+        self.source_image = torch_image.to(self.device).unsqueeze(dim=0)
 
     def predict(self, driving_frame):
         assert self.source_image is not None, "call set_source_image()"
